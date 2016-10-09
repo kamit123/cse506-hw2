@@ -1,0 +1,179 @@
+		README HW2
+
+	Part 1 - Files in submission
+
+hw2/amfsctl.c
+hw2/Makefile
+fs/Kconfig
+fs/Makefile
+fs/amfs/Kconfig
+fs/amfs/Makefile
+fs/amfs/amfs.h
+fs/amfs/amfs_ioctl.h
+fs/amfs/amfsctl.c
+fs/amfs/dentry.c
+fs/amfs/file.c
+fs/amfs/inode.c
+fs/amfs/install_module.sh
+fs/amfs/lookup.c
+fs/amfs/main.c
+fs/amfs/mmap.c
+fs/amfs/super.c
+include/uapi/linux/magic.h
+
+	Part 2 - Mounting the AMFS
+
+Incase the 'pattdb' argument is not passed while mounting the AMFS file
+system, it cannot be mounted.
+
+Once the 'pattdb' argument specifying the source of the virus pattern
+database is successfully received by amfs_mount() under void *raw_data.
+
+There were 2 options here:
+-Let the mount_nodev() complete, and then read the pattdb into the superblock's
+private info.
+-Interrupt mount_nodev() incase there is any error while reading pattdb.
+
+If we go with the first option and suppose there is any error while reading
+the pattdb, the AMFS file system is already mounted. So, I chose the second
+option.
+
+For implementing the second option, somehow void *raw_data needed to be passed
+to amfs_read_super(), so that the pattdb can be successfully read into
+superblock's private data field or else amfs_read_super() returning an error
+in case there was any issue with reading of pattdb().
+
+Since, there was no way to directly pass arguments to amfs_read_super(),
+I defined a struct:
+struct amfs_mount_data{
+        void *lower_path_name;
+        void *raw_data;
+};
+
+and initialized it with lower_path_name and raw_data, and passed it to
+amfs_read_super through mount_nodev().
+
+I have modified the struct sb_s_info to be as follows:
+/* amfs super-block data in memory */
+struct amfs_sb_info {
+        struct super_block *lower_sb;
+        char *pattdb_src;
+        struct list_head patt_list;
+        time_t version;
+};
+
+In amfs_read_super(), I have parsed the mount options, and stored the patted src
+into pattdb_src field of struct sb_s_info.
+Following that, the patted is read into a kernel defined link list and its head is
+stored as pattdb_list of struct sb_s_info.
+
+While reading the pattdb_src there are no limitations on the number of patterns in pattdb.
+
+Incases where the size of the pattdb spans over multiple buffers while reading,
+I have handled the issue by moving back the file offset to the last ‘\n’ encountered
+in the buffer so that I don’t have to deal with the half-pattern remaining after that,
+which will now be read again in the next cycle.
+Since, the assumption is that the length of the pattern is no more than 256 bytes,
+there will always be atleast 1 ‘\n’, if the number of bytes read = PAGE_SIZE.
+
+The pattdb version field is initialized with time since epoch.
+
+	Part 3 - Unmounting the AMFS
+
+While unmounting the AMFS, we need to free memory allocated to free pattern db related
+field, a amfs_kill_block_super() function is defined which will be called for kill_sb.
+It in turns calls kill_anon_super() and frees pattdb related fields thereafter.
+
+	Part 4 - Identifying malware in amfs_read
+
+In amfs_read, if a file is marked bad from before, we return an error before vfs_read().
+In case the file is not marked as bad, the data read is checked and if it contains
+a malware, the file is marked bad and an error is returned.
+
+	Part 5 - Identifying malware in amfs_write
+
+In amfs_write, if the file is marked bad from before, we don't even check the buf to be
+written for malware, we straight away return an error.
+In case the file is not marked bad from before, the buf to be written is checked for
+malware before vfs_write() is called and if it contains a malware, we return an error.
+The file is not marked bad in this case as the malware was never written into the file.
+
+	Part 6 - Identifying if a file is bad/good (for extra credit)
+
+Whenever we mark a file as bad/good (extra credit), we also store the value of the
+pattern db version against which it was checked in an XATTR.
+The existing state of a file, if marked, is only considered valid, if the current pattdb
+version and the pattdb version from the file's XATTR matches.
+
+	Part 7 - Denying lookup of a bad file
+
+In case a bad file is lookedup and if it does not exist in the cache, the amfs_lookup()
+function will return -ENOENT for that file.
+In case the file exists in the cache and amfs_lookup() is not called, amfs_open() will
+return -ENOENT. (Professor has mentioned in one of the mails, that we can choose this option.)
+
+	Part 8 - IOCTL handling
+
+The IOCTL add and remove pattern cases are handled by adding/removing the pattern from the
+pattdb_list in superblock and from the pattdb file on disk.
+
+Incase of the IOCTL command to list all the patterns, the patterns are returned to the user
+in the following structure:
+struct amfs_patterns_info
+{
+        char patterns[256][256];
+        int count;
+};
+
+Although there is no limit on the number of patterns that can be read from the pattern db
+into memory, only the first 256 patterns less than 256 bytes in length will be returned to
+the user.
+
+The user code to test the IOCTL is located under hw2-kamit/hw2.
+There is a make file which will generate the executable.
+
+	Part 9 - Hiding Bad files
+
+The bad files are being hidden by specifying our own amfs_filldir() function, which returns 0,
+in case the file is a bad file.
+To identify if a file is a bad file, we need to call vfs_getxattr() and for that we need the dentry
+of the file.
+
+To get the dentry of the file in a directory, I have called vfs_path_lookup().
+Now since vfs_path_lookup() takes a lock on the parent directory of the file which is already locked
+by readdir, there will be a deadlock.
+
+To avoid this deadlock, I have unlocked the parent directory before the vfs_path_lookup() call,
+as it will be locked/unlocked as part of vfs_path_lookup() and then locked it again once the
+vfs_path_lookup() completes.
+
+	Part 10 - Preventing removal of file's state XATTR
+
+In the vfs_remove_xattr() function, if the name of the XATTR received corresponds to the file's
+state or the pattdb version against which the file was checked, we return an error.
+
+	Part 11 - Extra Credit B. [15 pts] On-open/close file scan, tri-state file status.
+
+In order to compile the extra credit, '#define EXTRA_CREDIT 1' has to be mentioned in amfs.h.
+
+In this case, the amfs_open function verifies if the file is being opened with O_TRUNC mode.
+If yes, no further action is required.
+
+If no, it checks if the file is already marked as bad/good. 
+If it is marked bad, -ENOENT is returned.
+If the file is marked good, it is not scanned again for any possible malwares.
+
+If the file's state is unknown, the whole file is scanned for malwares and marked as bad/good.
+
+To take care of malware patterns falling in between buffers, I have taken three buffers:
+buf[PAGE_SIZE],
+prevbuf[PAGE_SIZE],
+totalbuf[PAGE_SIZE].
+
+The idea is to store the bytes read the last time into prevbuf and bytes read in current cycle
+in buf. Then combine the two buffers and check for malware on the combined buffer.
+
+	Part 12 - References
+
+http://git.fsl.cs.sunysb.edu/?p=wrapfs-4.0.y.git;a=tree
+http://lxr.free-electrons.com/source/fs/ecryptfs/file.c#L104
